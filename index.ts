@@ -7,6 +7,7 @@ type DiagnosticEventPayload =
 	| {
 			type: "model.usage";
 			ts: number;
+			trace?: DiagnosticTraceContext;
 			durationMs?: number;
 			provider?: string;
 			model?: string;
@@ -24,6 +25,7 @@ type DiagnosticEventPayload =
 	| {
 			type: "message.processed";
 			ts: number;
+			trace?: DiagnosticTraceContext;
 			durationMs?: number;
 			outcome: string;
 			error?: string;
@@ -56,6 +58,13 @@ type DiagnosticEventPayload =
 				functionName?: string;
 			};
 	  };
+
+type DiagnosticTraceContext = {
+	traceId?: string;
+	spanId?: string;
+	parentSpanId?: string;
+	traceFlags?: string;
+};
 
 type OpenClawPluginContext = {
 	logger: {
@@ -198,6 +207,14 @@ function handleDiagnosticEvent(evt: DiagnosticEventPayload): void {
 function recordModelUsage(
 	evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
 ): void {
+	withDiagnosticTrace(evt.trace, () => {
+		recordModelUsageSpan(evt);
+	});
+}
+
+function recordModelUsageSpan(
+	evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
+): void {
 	const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
 	const endTimeMs = evt.ts;
 	const durationMs = evt.durationMs ?? 100;
@@ -235,6 +252,14 @@ function recordModelUsage(
 function recordMessageProcessed(
 	evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
 ): void {
+	withDiagnosticTrace(evt.trace, () => {
+		recordMessageProcessedSpan(evt);
+	});
+}
+
+function recordMessageProcessedSpan(
+	evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
+): void {
 	const endTimeMs = evt.ts;
 	const durationMs = evt.durationMs ?? 50;
 	const startTimeMs = endTimeMs - durationMs;
@@ -266,6 +291,28 @@ function recordMessageProcessed(
 		}
 		span.end(endTimeMs);
 	}
+}
+
+function withDiagnosticTrace(
+	trace: DiagnosticTraceContext | undefined,
+	fn: () => void,
+): void {
+	const sentryTrace = formatSentryTraceHeader(trace);
+	if (!sentryTrace) {
+		fn();
+		return;
+	}
+
+	Sentry.continueTrace({ sentryTrace, baggage: undefined }, fn);
+}
+
+function formatSentryTraceHeader(
+	trace: DiagnosticTraceContext | undefined,
+): string | undefined {
+	if (!trace?.traceId || !trace.spanId) return undefined;
+
+	const sampled = trace.traceFlags === "00" ? "0" : "1";
+	return `${trace.traceId}-${trace.spanId}-${sampled}`;
 }
 
 // ── Diagnostic log records → Sentry structured logs ──────────

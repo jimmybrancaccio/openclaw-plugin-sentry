@@ -92,6 +92,11 @@ function handleDiagnosticEvent(evt) {
 }
 // ── Model usage → ai.chat span with real duration ───────────
 function recordModelUsage(evt) {
+    withDiagnosticTrace(evt.trace, () => {
+        recordModelUsageSpan(evt);
+    });
+}
+function recordModelUsageSpan(evt) {
     const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
@@ -123,6 +128,11 @@ function recordModelUsage(evt) {
 }
 // ── Message processed → openclaw.message span ───────────────
 function recordMessageProcessed(evt) {
+    withDiagnosticTrace(evt.trace, () => {
+        recordMessageProcessedSpan(evt);
+    });
+}
+function recordMessageProcessedSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 50;
     const startTimeMs = endTimeMs - durationMs;
@@ -152,6 +162,20 @@ function recordMessageProcessed(evt) {
         }
         span.end(endTimeMs);
     }
+}
+function withDiagnosticTrace(trace, fn) {
+    const sentryTrace = formatSentryTraceHeader(trace);
+    if (!sentryTrace) {
+        fn();
+        return;
+    }
+    Sentry.continueTrace({ sentryTrace, baggage: undefined }, fn);
+}
+function formatSentryTraceHeader(trace) {
+    if (!trace?.traceId || !trace.spanId)
+        return undefined;
+    const sampled = trace.traceFlags === "00" ? "0" : "1";
+    return `${trace.traceId}-${trace.spanId}-${sampled}`;
 }
 // ── Diagnostic log records → Sentry structured logs ──────────
 function forwardLogRecord(evt) {
