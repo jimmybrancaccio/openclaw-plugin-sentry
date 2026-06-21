@@ -79,23 +79,10 @@ type OpenClawPluginApi = {
 	registerService(service: OpenClawPluginService): void;
 };
 
-type TelemetryStats = {
-	diagnosticEvents: number;
-	logRecords: number;
-	modelUsage: number;
-	messageProcessed: number;
-	capturedMessages: number;
-	spans: number;
-	logFlushes: number;
-	clientFlushes: number;
-	flushErrors: number;
-};
-
 export function createSentryService(): OpenClawPluginService {
 	let unsubDiag: (() => void) | null = null;
 	let telemetryFlushInterval: ReturnType<typeof setInterval> | null = null;
 	let flushInFlight = false;
-	const stats = createTelemetryStats();
 
 	return {
 		id: "sentry",
@@ -136,12 +123,11 @@ export function createSentryService(): OpenClawPluginService {
 			// ── 2. Diagnostic events → Sentry spans + messages ─────
 			unsubDiag = onInternalDiagnosticEvent((evt: DiagnosticEventPayload) => {
 				try {
-					stats.diagnosticEvents += 1;
 					if (evt.type === "log.record") {
-						if (enableLogs) forwardLogRecord(evt, stats);
+						if (enableLogs) forwardLogRecord(evt);
 						return;
 					}
-					handleDiagnosticEvent(evt, stats);
+					handleDiagnosticEvent(evt);
 				} catch {
 					// Don't let telemetry errors affect the gateway
 				}
@@ -153,8 +139,6 @@ export function createSentryService(): OpenClawPluginService {
 			}
 			telemetryFlushInterval = setInterval(() => {
 				void flushSentryTelemetry(
-					ctx,
-					stats,
 					() => flushInFlight,
 					(value) => {
 						flushInFlight = value;
@@ -179,25 +163,19 @@ export function createSentryService(): OpenClawPluginService {
 
 // ── Diagnostic events → spans / messages ────────────────────
 
-function handleDiagnosticEvent(
-	evt: DiagnosticEventPayload,
-	stats: TelemetryStats,
-): void {
+function handleDiagnosticEvent(evt: DiagnosticEventPayload): void {
 	switch (evt.type) {
 		case "model.usage":
-			stats.modelUsage += 1;
-			recordModelUsage(evt, stats);
+			recordModelUsage(evt);
 			return;
 		case "message.processed":
-			stats.messageProcessed += 1;
-			recordMessageProcessed(evt, stats);
+			recordMessageProcessed(evt);
 			return;
 		case "webhook.error":
 			Sentry.captureMessage(`Webhook error: ${evt.error}`, {
 				level: "error",
 				tags: { channel: evt.channel, updateType: evt.updateType },
 			});
-			stats.capturedMessages += 1;
 			return;
 		case "session.stuck":
 			Sentry.captureMessage(
@@ -207,7 +185,6 @@ function handleDiagnosticEvent(
 					tags: { sessionKey: evt.sessionKey, state: evt.state },
 				},
 			);
-			stats.capturedMessages += 1;
 			return;
 		case "log.record":
 			return;
@@ -220,7 +197,6 @@ function handleDiagnosticEvent(
 
 function recordModelUsage(
 	evt: Extract<DiagnosticEventPayload, { type: "model.usage" }>,
-	stats: TelemetryStats,
 ): void {
 	const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
 	const endTimeMs = evt.ts;
@@ -252,16 +228,12 @@ function recordModelUsage(
 	});
 
 	span?.end(endTimeMs);
-	if (span?.isRecording()) {
-		stats.spans += 1;
-	}
 }
 
 // ── Message processed → openclaw.message span ───────────────
 
 function recordMessageProcessed(
 	evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
-	stats: TelemetryStats,
 ): void {
 	const endTimeMs = evt.ts;
 	const durationMs = evt.durationMs ?? 50;
@@ -290,13 +262,9 @@ function recordMessageProcessed(
 					level: "error",
 					tags: { channel: evt.channel, sessionKey: evt.sessionKey },
 				});
-				stats.capturedMessages += 1;
 			}
 		}
 		span.end(endTimeMs);
-		if (span.isRecording()) {
-			stats.spans += 1;
-		}
 	}
 }
 
@@ -304,11 +272,9 @@ function recordMessageProcessed(
 
 function forwardLogRecord(
 	evt: Extract<DiagnosticEventPayload, { type: "log.record" }>,
-	stats: TelemetryStats,
 ): void {
 	const loggerApi = Sentry.logger;
 	if (!loggerApi) return;
-	stats.logRecords += 1;
 
 	const attrs: Record<string, string | number | boolean> = {
 		...evt.attributes,
@@ -357,8 +323,6 @@ function flushSentryLogs(): void {
 }
 
 async function flushSentryTelemetry(
-	ctx: OpenClawPluginContext,
-	stats: TelemetryStats,
 	getFlushInFlight: () => boolean,
 	setFlushInFlight: (value: boolean) => void,
 ): Promise<void> {
@@ -366,34 +330,12 @@ async function flushSentryTelemetry(
 	setFlushInFlight(true);
 	try {
 		flushSentryLogs();
-		stats.logFlushes += 1;
 		await Sentry.flush(5000);
-		stats.clientFlushes += 1;
-		ctx.logger.info(formatTelemetryStats(stats));
 	} catch {
-		stats.flushErrors += 1;
-		ctx.logger.warn(formatTelemetryStats(stats));
+		// Keep flush failures non-fatal and quiet. Sentry will retry through its SDK.
 	} finally {
 		setFlushInFlight(false);
 	}
-}
-
-function createTelemetryStats(): TelemetryStats {
-	return {
-		diagnosticEvents: 0,
-		logRecords: 0,
-		modelUsage: 0,
-		messageProcessed: 0,
-		capturedMessages: 0,
-		spans: 0,
-		logFlushes: 0,
-		clientFlushes: 0,
-		flushErrors: 0,
-	};
-}
-
-function formatTelemetryStats(stats: TelemetryStats): string {
-	return `sentry: telemetry stats events=${stats.diagnosticEvents} logs=${stats.logRecords} modelUsage=${stats.modelUsage} messageProcessed=${stats.messageProcessed} messages=${stats.capturedMessages} spans=${stats.spans} logFlushes=${stats.logFlushes} clientFlushes=${stats.clientFlushes} flushErrors=${stats.flushErrors}`;
 }
 
 // ── Plugin entry point ──────────────────────────────────────

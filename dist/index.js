@@ -6,7 +6,6 @@ export function createSentryService() {
     let unsubDiag = null;
     let telemetryFlushInterval = null;
     let flushInFlight = false;
-    const stats = createTelemetryStats();
     return {
         id: "sentry",
         async start(ctx) {
@@ -30,13 +29,12 @@ export function createSentryService() {
             // ── 2. Diagnostic events → Sentry spans + messages ─────
             unsubDiag = onInternalDiagnosticEvent((evt) => {
                 try {
-                    stats.diagnosticEvents += 1;
                     if (evt.type === "log.record") {
                         if (enableLogs)
-                            forwardLogRecord(evt, stats);
+                            forwardLogRecord(evt);
                         return;
                     }
-                    handleDiagnosticEvent(evt, stats);
+                    handleDiagnosticEvent(evt);
                 }
                 catch {
                     // Don't let telemetry errors affect the gateway
@@ -47,7 +45,7 @@ export function createSentryService() {
                 ctx.logger.info("sentry: subscribed to diagnostic log records");
             }
             telemetryFlushInterval = setInterval(() => {
-                void flushSentryTelemetry(ctx, stats, () => flushInFlight, (value) => {
+                void flushSentryTelemetry(() => flushInFlight, (value) => {
                     flushInFlight = value;
                 });
             }, 30_000);
@@ -66,29 +64,25 @@ export function createSentryService() {
     };
 }
 // ── Diagnostic events → spans / messages ────────────────────
-function handleDiagnosticEvent(evt, stats) {
+function handleDiagnosticEvent(evt) {
     switch (evt.type) {
         case "model.usage":
-            stats.modelUsage += 1;
-            recordModelUsage(evt, stats);
+            recordModelUsage(evt);
             return;
         case "message.processed":
-            stats.messageProcessed += 1;
-            recordMessageProcessed(evt, stats);
+            recordMessageProcessed(evt);
             return;
         case "webhook.error":
             Sentry.captureMessage(`Webhook error: ${evt.error}`, {
                 level: "error",
                 tags: { channel: evt.channel, updateType: evt.updateType },
             });
-            stats.capturedMessages += 1;
             return;
         case "session.stuck":
             Sentry.captureMessage(`Session stuck: ${evt.sessionKey} (${evt.ageMs}ms)`, {
                 level: "warning",
                 tags: { sessionKey: evt.sessionKey, state: evt.state },
             });
-            stats.capturedMessages += 1;
             return;
         case "log.record":
             return;
@@ -97,7 +91,7 @@ function handleDiagnosticEvent(evt, stats) {
     }
 }
 // ── Model usage → ai.chat span with real duration ───────────
-function recordModelUsage(evt, stats) {
+function recordModelUsage(evt) {
     const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
@@ -126,12 +120,9 @@ function recordModelUsage(evt, stats) {
         },
     });
     span?.end(endTimeMs);
-    if (span?.isRecording()) {
-        stats.spans += 1;
-    }
 }
 // ── Message processed → openclaw.message span ───────────────
-function recordMessageProcessed(evt, stats) {
+function recordMessageProcessed(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 50;
     const startTimeMs = endTimeMs - durationMs;
@@ -157,21 +148,16 @@ function recordMessageProcessed(evt, stats) {
                     level: "error",
                     tags: { channel: evt.channel, sessionKey: evt.sessionKey },
                 });
-                stats.capturedMessages += 1;
             }
         }
         span.end(endTimeMs);
-        if (span.isRecording()) {
-            stats.spans += 1;
-        }
     }
 }
 // ── Diagnostic log records → Sentry structured logs ──────────
-function forwardLogRecord(evt, stats) {
+function forwardLogRecord(evt) {
     const loggerApi = Sentry.logger;
     if (!loggerApi)
         return;
-    stats.logRecords += 1;
     const attrs = {
         ...evt.attributes,
     };
@@ -214,40 +200,20 @@ function flushSentryLogs() {
         _INTERNAL_flushLogsBuffer(client);
     }
 }
-async function flushSentryTelemetry(ctx, stats, getFlushInFlight, setFlushInFlight) {
+async function flushSentryTelemetry(getFlushInFlight, setFlushInFlight) {
     if (getFlushInFlight())
         return;
     setFlushInFlight(true);
     try {
         flushSentryLogs();
-        stats.logFlushes += 1;
         await Sentry.flush(5000);
-        stats.clientFlushes += 1;
-        ctx.logger.info(formatTelemetryStats(stats));
     }
     catch {
-        stats.flushErrors += 1;
-        ctx.logger.warn(formatTelemetryStats(stats));
+        // Keep flush failures non-fatal and quiet. Sentry will retry through its SDK.
     }
     finally {
         setFlushInFlight(false);
     }
-}
-function createTelemetryStats() {
-    return {
-        diagnosticEvents: 0,
-        logRecords: 0,
-        modelUsage: 0,
-        messageProcessed: 0,
-        capturedMessages: 0,
-        spans: 0,
-        logFlushes: 0,
-        clientFlushes: 0,
-        flushErrors: 0,
-    };
-}
-function formatTelemetryStats(stats) {
-    return `sentry: telemetry stats events=${stats.diagnosticEvents} logs=${stats.logRecords} modelUsage=${stats.modelUsage} messageProcessed=${stats.messageProcessed} messages=${stats.capturedMessages} spans=${stats.spans} logFlushes=${stats.logFlushes} clientFlushes=${stats.clientFlushes} flushErrors=${stats.flushErrors}`;
 }
 // ── Plugin entry point ──────────────────────────────────────
 export default definePluginEntry({
