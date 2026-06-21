@@ -1,5 +1,5 @@
 import * as Sentry from "@sentry/node";
-// @ts-ignore
+// @ts-expect-error openclaw is an optional peer dependency for plugin consumers.
 import { onDiagnosticEvent, registerLogTransport } from "openclaw/plugin-sdk";
 export function createSentryService() {
     let unsubDiag = null;
@@ -7,6 +7,7 @@ export function createSentryService() {
     return {
         id: "sentry",
         async start(ctx) {
+            ctx.logger.info("sentry: start() entered");
             const entries = ctx.config.plugins?.entries;
             const pluginCfg = entries?.sentry?.config;
             const dsn = pluginCfg?.dsn;
