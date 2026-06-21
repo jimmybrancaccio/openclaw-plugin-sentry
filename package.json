@@ -26,6 +26,7 @@
 		"genai"
 	],
 	"dependencies": {
+		"@sentry/core": "^10.59.0",
 		"@sentry/node": "^10.39.0"
 	},
 	"devDependencies": {

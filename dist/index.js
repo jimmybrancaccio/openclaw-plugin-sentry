@@ -1,7 +1,9 @@
+import { _INTERNAL_flushLogsBuffer } from "@sentry/core";
 import * as Sentry from "@sentry/node";
 import { onInternalDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 export function createSentryService() {
     let unsubDiag = null;
+    let logFlushInterval = null;
     return {
         id: "sentry",
         async start(ctx) {
@@ -38,12 +40,19 @@ export function createSentryService() {
             });
             ctx.logger.info("sentry: subscribed to diagnostic events");
             if (enableLogs) {
+                logFlushInterval = setInterval(flushSentryLogs, 30_000);
                 ctx.logger.info("sentry: subscribed to diagnostic log records");
+                ctx.logger.info("sentry: flushing diagnostic log records every 30s");
             }
         },
         async stop() {
             unsubDiag?.();
             unsubDiag = null;
+            if (logFlushInterval) {
+                clearInterval(logFlushInterval);
+                logFlushInterval = null;
+            }
+            flushSentryLogs();
             await Sentry.flush(5000).catch(() => undefined);
         },
     };
@@ -177,6 +186,12 @@ function forwardLogRecord(evt) {
             return;
         default:
             loggerApi.info(evt.message, attrs);
+    }
+}
+function flushSentryLogs() {
+    const client = Sentry.getClient();
+    if (client) {
+        _INTERNAL_flushLogsBuffer(client);
     }
 }
 // ── Plugin entry point ──────────────────────────────────────
