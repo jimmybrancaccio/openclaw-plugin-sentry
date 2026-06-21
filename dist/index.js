@@ -1,5 +1,5 @@
 import * as Sentry from "@sentry/node";
-import { onDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
+import { onInternalDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 export function createSentryService() {
     let unsubDiag = null;
     return {
@@ -23,8 +23,13 @@ export function createSentryService() {
             });
             ctx.logger.info(`sentry: initialized (dsn=...${dsn.slice(-12)}, env=${pluginCfg?.environment ?? "production"}, logs=${enableLogs})`);
             // ── 2. Diagnostic events → Sentry spans + messages ─────
-            unsubDiag = onDiagnosticEvent((evt) => {
+            unsubDiag = onInternalDiagnosticEvent((evt) => {
                 try {
+                    if (evt.type === "log.record") {
+                        if (enableLogs)
+                            forwardLogRecord(evt);
+                        return;
+                    }
                     handleDiagnosticEvent(evt);
                 }
                 catch {
@@ -33,7 +38,7 @@ export function createSentryService() {
             });
             ctx.logger.info("sentry: subscribed to diagnostic events");
             if (enableLogs) {
-                ctx.logger.info("sentry: structured log forwarding skipped; this OpenClaw runtime does not expose a plugin log transport");
+                ctx.logger.info("sentry: subscribed to diagnostic log records");
             }
         },
         async stop() {
@@ -63,6 +68,8 @@ function handleDiagnosticEvent(evt) {
                 level: "warning",
                 tags: { sessionKey: evt.sessionKey, state: evt.state },
             });
+            return;
+        case "log.record":
             return;
         // Silently ignore event types we don't handle (webhook.received,
         // session.state, queue.lane.*, diagnostic.heartbeat, etc.)
@@ -129,6 +136,47 @@ function recordMessageProcessed(evt) {
             }
         }
         span.end(endTimeMs);
+    }
+}
+// ── Diagnostic log records → Sentry structured logs ──────────
+function forwardLogRecord(evt) {
+    const loggerApi = Sentry.logger;
+    if (!loggerApi)
+        return;
+    const attrs = {
+        ...evt.attributes,
+    };
+    if (evt.loggerName) {
+        attrs["openclaw.logger"] = evt.loggerName;
+    }
+    if (evt.loggerParents?.length) {
+        attrs["openclaw.logger_parents"] = evt.loggerParents.join(".");
+    }
+    if (evt.code?.line !== undefined) {
+        attrs["code.line"] = evt.code.line;
+    }
+    if (evt.code?.functionName) {
+        attrs["code.function"] = evt.code.functionName;
+    }
+    switch (evt.level.toLowerCase()) {
+        case "debug":
+            loggerApi.debug(evt.message, attrs);
+            return;
+        case "trace":
+            loggerApi.trace(evt.message, attrs);
+            return;
+        case "warn":
+        case "warning":
+            loggerApi.warn(evt.message, attrs);
+            return;
+        case "error":
+            loggerApi.error(evt.message, attrs);
+            return;
+        case "fatal":
+            loggerApi.fatal(evt.message, attrs);
+            return;
+        default:
+            loggerApi.info(evt.message, attrs);
     }
 }
 // ── Plugin entry point ──────────────────────────────────────
