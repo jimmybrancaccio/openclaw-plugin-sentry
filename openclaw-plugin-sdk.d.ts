@@ -1,9 +1,5 @@
-declare module "openclaw/plugin-sdk" {
+declare module "openclaw/plugin-sdk/diagnostic-runtime" {
 	export function onDiagnosticEvent<TEvent = unknown>(
 		handler: (event: TEvent) => void,
-	): () => void;
-
-	export function registerLogTransport<TLog extends Record<string, unknown>>(
-		handler: (log: TLog) => void,
 	): () => void;
 }

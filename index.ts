@@ -1,5 +1,5 @@
 import * as Sentry from "@sentry/node";
-import { onDiagnosticEvent, registerLogTransport } from "openclaw/plugin-sdk";
+import { onDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 
 type DiagnosticEventPayload =
 	| {
@@ -67,7 +67,6 @@ type OpenClawPluginApi = {
 
 export function createSentryService(): OpenClawPluginService {
 	let unsubDiag: (() => void) | null = null;
-	let unsubLogs: (() => void) | null = null;
 
 	return {
 		id: "sentry",
@@ -115,24 +114,16 @@ export function createSentryService(): OpenClawPluginService {
 			});
 			ctx.logger.info("sentry: subscribed to diagnostic events");
 
-			// ── 3. Gateway logs → Sentry structured logs ───────────
 			if (enableLogs) {
-				unsubLogs = registerLogTransport((logObj: Record<string, unknown>) => {
-					try {
-						forwardLog(logObj);
-					} catch {
-						// Silent — don't let log forwarding errors cascade
-					}
-				});
-				ctx.logger.info("sentry: subscribed to log transport");
+				ctx.logger.info(
+					"sentry: structured log forwarding skipped; this OpenClaw runtime does not expose a plugin log transport",
+				);
 			}
 		},
 
 		async stop() {
 			unsubDiag?.();
 			unsubDiag = null;
-			unsubLogs?.();
-			unsubLogs = null;
 			await Sentry.flush(5000).catch((): undefined => undefined);
 		},
 	};
@@ -240,66 +231,6 @@ function recordMessageProcessed(
 			}
 		}
 		span.end(endTimeMs);
-	}
-}
-
-// ── Log forwarding → Sentry structured logs ─────────────────
-
-function forwardLog(logObj: Record<string, unknown>): void {
-	const meta = logObj._meta as
-		| { logLevelName?: string; name?: string; date?: Date }
-		| undefined;
-
-	const level = (meta?.logLevelName ?? "INFO").toLowerCase();
-
-	// OpenClaw log transport format: numeric keys are positional args.
-	// Typically: "0" = subsystem/context tag, "1" = message string
-	const numericEntries = Object.entries(logObj)
-		.filter(([key]) => /^\d+$/.test(key))
-		.sort((a, b) => Number(a[0]) - Number(b[0]));
-
-	let subsystem = "";
-	let message = "";
-
-	if (numericEntries.length >= 2) {
-		// First arg is usually the subsystem tag, last is the message
-		subsystem = String(numericEntries[0][1]);
-		const lastVal = numericEntries[numericEntries.length - 1][1];
-		message = typeof lastVal === "string" ? lastVal : JSON.stringify(lastVal);
-	} else if (numericEntries.length === 1) {
-		const val = numericEntries[0][1];
-		message = typeof val === "string" ? val : JSON.stringify(val);
-	}
-
-	if (!message) message = "log";
-
-	const loggerName = meta?.name ?? "openclaw";
-
-	const loggerApi = Sentry.logger;
-	if (!loggerApi) return;
-
-	const attrs: Record<string, string> = {
-		"openclaw.logger": loggerName,
-	};
-	if (subsystem) {
-		attrs["openclaw.subsystem"] = subsystem;
-	}
-
-	// Route to appropriate Sentry log level
-	switch (level) {
-		case "debug":
-		case "trace":
-			loggerApi.debug(message, attrs);
-			break;
-		case "warn":
-			loggerApi.warn(message, attrs);
-			break;
-		case "error":
-		case "fatal":
-			loggerApi.error(message, attrs);
-			break;
-		default:
-			loggerApi.info(message, attrs);
 	}
 }
 
