@@ -173,6 +173,23 @@ function recordModelCallSpan(evt) {
         span.end(endTimeMs);
     }
 }
+function recordModelCallHook(evt, ctx) {
+    recordModelCallSpan({
+        type: evt.outcome === "error" ? "model.call.error" : "model.call.completed",
+        ts: Date.now(),
+        trace: ctx.trace,
+        durationMs: evt.durationMs,
+        provider: evt.provider,
+        model: evt.model,
+        channel: ctx.channel,
+        sessionKey: evt.sessionKey ?? ctx.sessionKey,
+        requestPayloadBytes: evt.requestPayloadBytes,
+        responseStreamBytes: evt.responseStreamBytes,
+        timeToFirstByteMs: evt.timeToFirstByteMs,
+        errorCategory: evt.errorCategory,
+        failureKind: evt.failureKind,
+    });
+}
 // ── Message processed → openclaw.message span ───────────────
 function recordMessageProcessed(evt) {
     withDiagnosticTrace(evt.trace, () => {
@@ -294,5 +311,13 @@ export default definePluginEntry({
     kind: "service",
     register(api) {
         api.registerService(createSentryService());
+        api.on?.("model_call_ended", (event, ctx) => {
+            try {
+                recordModelCallHook(event, ctx);
+            }
+            catch {
+                // Keep hook failures non-fatal; Sentry telemetry must not affect replies.
+            }
+        }, { timeoutMs: 5000 });
     },
 });

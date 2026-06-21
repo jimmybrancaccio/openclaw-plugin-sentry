@@ -87,6 +87,29 @@ type DiagnosticEventPayload =
 			};
 	  };
 
+type ModelCallEndedHookEvent = {
+	runId: string;
+	callId: string;
+	sessionKey?: string;
+	sessionId?: string;
+	provider: string;
+	model: string;
+	durationMs: number;
+	outcome: "completed" | "error";
+	errorCategory?: string;
+	failureKind?: string;
+	requestPayloadBytes?: number;
+	responseStreamBytes?: number;
+	timeToFirstByteMs?: number;
+};
+
+type PluginHookAgentContext = {
+	trace?: DiagnosticTraceContext;
+	channel?: string;
+	sessionKey?: string;
+	sessionId?: string;
+};
+
 type DiagnosticTraceContext = {
 	traceId?: string;
 	spanId?: string;
@@ -114,6 +137,14 @@ type OpenClawPluginService = {
 
 type OpenClawPluginApi = {
 	registerService(service: OpenClawPluginService): void;
+	on?(
+		hookName: "model_call_ended",
+		handler: (
+			event: ModelCallEndedHookEvent,
+			ctx: PluginHookAgentContext,
+		) => Promise<void> | void,
+		opts?: { priority?: number; timeoutMs?: number },
+	): void;
 };
 
 export function createSentryService(): OpenClawPluginService {
@@ -340,6 +371,27 @@ function recordModelCallSpan(
 	}
 }
 
+function recordModelCallHook(
+	evt: ModelCallEndedHookEvent,
+	ctx: PluginHookAgentContext,
+): void {
+	recordModelCallSpan({
+		type: evt.outcome === "error" ? "model.call.error" : "model.call.completed",
+		ts: Date.now(),
+		trace: ctx.trace,
+		durationMs: evt.durationMs,
+		provider: evt.provider,
+		model: evt.model,
+		channel: ctx.channel,
+		sessionKey: evt.sessionKey ?? ctx.sessionKey,
+		requestPayloadBytes: evt.requestPayloadBytes,
+		responseStreamBytes: evt.responseStreamBytes,
+		timeToFirstByteMs: evt.timeToFirstByteMs,
+		errorCategory: evt.errorCategory,
+		failureKind: evt.failureKind,
+	});
+}
+
 // ── Message processed → openclaw.message span ───────────────
 
 function recordMessageProcessed(
@@ -488,5 +540,16 @@ export default definePluginEntry({
 	kind: "service",
 	register(api: OpenClawPluginApi) {
 		api.registerService(createSentryService());
+		api.on?.(
+			"model_call_ended",
+			(event, ctx) => {
+				try {
+					recordModelCallHook(event, ctx);
+				} catch {
+					// Keep hook failures non-fatal; Sentry telemetry must not affect replies.
+				}
+			},
+			{ timeoutMs: 5000 },
+		);
 	},
 });
