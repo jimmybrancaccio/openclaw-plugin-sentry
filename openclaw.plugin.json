@@ -1,18 +1,32 @@
 {
-  "id": "sentry",
-  "name": "Sentry",
-  "description": "Send errors, logs, and traces from your OpenClaw instance to Sentry",
-  "version": "0.1.0",
-  "kind": "service",
-  "entry": "index.ts",
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": true,
-    "properties": {
-      "dsn": { "type": "string", "description": "Sentry DSN from your project's Client Keys" },
-      "environment": { "type": "string", "description": "Environment name (production, staging, etc.)" },
-      "tracesSampleRate": { "type": "number", "description": "Traces sample rate (0.0-1.0)" },
-      "enableLogs": { "type": "boolean", "description": "Enable Sentry structured logs" }
-    }
-  }
+	"id": "sentry",
+	"name": "Sentry",
+	"description": "Send errors, logs, and traces from your OpenClaw instance to Sentry",
+	"version": "0.1.0",
+	"kind": "service",
+	"activation": {
+		"onStartup": true
+	},
+	"configSchema": {
+		"type": "object",
+		"additionalProperties": true,
+		"properties": {
+			"dsn": {
+				"type": "string",
+				"description": "Sentry DSN from your project's Client Keys"
+			},
+			"environment": {
+				"type": "string",
+				"description": "Environment name (production, staging, etc.)"
+			},
+			"tracesSampleRate": {
+				"type": "number",
+				"description": "Traces sample rate (0.0-1.0)"
+			},
+			"enableLogs": {
+				"type": "boolean",
+				"description": "Enable Sentry structured logs"
+			}
+		}
+	}
 }

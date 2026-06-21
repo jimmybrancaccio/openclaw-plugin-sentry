@@ -1,54 +1,55 @@
 {
-  "name": "openclaw-plugin-sentry",
-  "version": "0.1.0",
-  "description": "Sentry integration for OpenClaw — errors, traces, and structured logs",
-  "type": "module",
-  "main": "./dist/index.js",
-  "scripts": {
-    "build": "tsc index.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --outDir dist --esModuleInterop --skipLibCheck",
-    "prepare": "npm run build"
-  },
-  "license": "MIT",
-  "author": "Sergiy Dybskiy <s@serg.tech>",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/sergical/openclaw-plugin-sentry"
-  },
-  "keywords": [
-    "openclaw",
-    "openclaw-plugin",
-    "sentry",
-    "observability",
-    "tracing",
-    "logging",
-    "error-tracking",
-    "ai-agent",
-    "genai"
-  ],
-  "dependencies": {
-    "@sentry/node": "^10.39.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3"
-  },
-  "peerDependencies": {
-    "openclaw": ">=2026.2.0"
-  },
-  "peerDependenciesMeta": {
-    "openclaw": {
-      "optional": true
-    }
-  },
-  "openclaw": {
-    "extensions": [
-      "./dist/index.js"
-    ]
-  },
-  "files": [
-    "dist/",
-    "index.ts",
-    "openclaw.plugin.json",
-    "README.md",
-    "LICENSE"
-  ]
+	"name": "openclaw-plugin-sentry",
+	"version": "0.1.0",
+	"description": "Sentry integration for OpenClaw — errors, traces, and structured logs",
+	"type": "module",
+	"main": "./dist/index.js",
+	"scripts": {
+		"build": "tsc index.ts openclaw-plugin-sdk.d.ts --target ES2022 --module NodeNext --moduleResolution NodeNext --outDir dist --esModuleInterop --skipLibCheck",
+		"prepare": "npm run build"
+	},
+	"license": "MIT",
+	"author": "Sergiy Dybskiy <s@serg.tech>",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/sergical/openclaw-plugin-sentry"
+	},
+	"keywords": [
+		"openclaw",
+		"openclaw-plugin",
+		"sentry",
+		"observability",
+		"tracing",
+		"logging",
+		"error-tracking",
+		"ai-agent",
+		"genai"
+	],
+	"dependencies": {
+		"@sentry/node": "^10.39.0"
+	},
+	"devDependencies": {
+		"typescript": "^5.9.3"
+	},
+	"peerDependencies": {
+		"openclaw": ">=2026.2.0"
+	},
+	"peerDependenciesMeta": {
+		"openclaw": {
+			"optional": true
+		}
+	},
+	"openclaw": {
+		"extensions": [
+			"./dist/index.js"
+		]
+	},
+	"files": [
+		"dist/",
+		"index.ts",
+		"openclaw-plugin-sdk.d.ts",
+		"openclaw.plugin.json",
+		"README.md",
+		"LICENSE"
+	]
 }
