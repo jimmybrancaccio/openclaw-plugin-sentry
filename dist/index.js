@@ -72,6 +72,12 @@ function handleDiagnosticEvent(evt) {
         case "message.processed":
             recordMessageProcessed(evt);
             return;
+        case "model.call.completed":
+            recordModelCall(evt);
+            return;
+        case "model.call.error":
+            recordModelCall(evt);
+            return;
         case "webhook.error":
             Sentry.captureMessage(`Webhook error: ${evt.error}`, {
                 level: "error",
@@ -125,6 +131,47 @@ function recordModelUsageSpan(evt) {
         },
     });
     span?.end(endTimeMs);
+}
+// ── Model call lifecycle → ai.chat transaction ──────────────
+function recordModelCall(evt) {
+    withDiagnosticTrace(evt.trace, () => {
+        recordModelCallSpan(evt);
+    });
+}
+function recordModelCallSpan(evt) {
+    const spanName = evt.model ? `model call ${evt.model}` : "model call unknown";
+    const endTimeMs = evt.ts;
+    const durationMs = evt.durationMs ?? 100;
+    const startTimeMs = endTimeMs - durationMs;
+    const span = Sentry.startInactiveSpan({
+        op: "ai.chat",
+        name: spanName,
+        startTime: startTimeMs,
+        forceTransaction: true,
+        attributes: {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system": evt.provider ?? "unknown",
+            "gen_ai.request.model": evt.model ?? "unknown",
+            "openclaw.channel": evt.channel ?? "unknown",
+            "openclaw.session_key": evt.sessionKey ?? "unknown",
+            "openclaw.duration_ms": durationMs,
+            "openclaw.request_payload_bytes": evt.requestPayloadBytes ?? 0,
+            "openclaw.response_stream_bytes": evt.responseStreamBytes ?? 0,
+            "openclaw.time_to_first_byte_ms": evt.timeToFirstByteMs ?? 0,
+            "openclaw.outcome": evt.type === "model.call.error" ? "error" : "completed",
+            "openclaw.error_category": evt.type === "model.call.error" ? (evt.errorCategory ?? "unknown") : "",
+            "openclaw.failure_kind": evt.type === "model.call.error" ? (evt.failureKind ?? "unknown") : "",
+        },
+    });
+    if (span) {
+        if (evt.type === "model.call.error") {
+            span.setStatus({
+                code: 2,
+                message: evt.failureKind ?? evt.errorCategory ?? "model call error",
+            });
+        }
+        span.end(endTimeMs);
+    }
 }
 // ── Message processed → openclaw.message span ───────────────
 function recordMessageProcessed(evt) {
