@@ -1,6 +1,9 @@
 import * as Sentry from "@sentry/node";
+// @ts-ignore
 import type { DiagnosticEventPayload } from "openclaw/plugin-sdk";
+// @ts-ignore
 import { onDiagnosticEvent, registerLogTransport } from "openclaw/plugin-sdk";
+// @ts-ignore
 import type { OpenClawPluginService } from "openclaw/plugin-sdk";
 
 export function createSentryService(): OpenClawPluginService {
