@@ -204,6 +204,7 @@ export function createSentryService(): OpenClawPluginService {
 						if (enableLogs) forwardLogRecord(evt);
 						return;
 					}
+					ctx.logger.info(`sentry: diagnostic event ${evt.type}`);
 					handleDiagnosticEvent(evt, metadata);
 				} catch {
 					// Don't let telemetry errors affect the gateway

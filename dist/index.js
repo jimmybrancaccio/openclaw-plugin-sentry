@@ -35,6 +35,7 @@ export function createSentryService() {
                             forwardLogRecord(evt);
                         return;
                     }
+                    ctx.logger.info(`sentry: diagnostic event ${evt.type}`);
                     handleDiagnosticEvent(evt, metadata);
                 }
                 catch {
