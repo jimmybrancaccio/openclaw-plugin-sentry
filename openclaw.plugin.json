@@ -3,7 +3,6 @@
 	"name": "Sentry",
 	"description": "Send errors, logs, and traces from your OpenClaw instance to Sentry",
 	"version": "0.1.0",
-	"kind": "service",
 	"activation": {
 		"onStartup": true
 	},

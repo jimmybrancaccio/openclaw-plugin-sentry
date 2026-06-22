@@ -308,10 +308,14 @@ export default definePluginEntry({
     id: "sentry",
     name: "Sentry",
     description: "Send errors, logs, and traces from your OpenClaw instance to Sentry",
-    kind: "service",
     register(api) {
         api.registerService(createSentryService());
-        api.on?.("model_call_ended", (event, ctx) => {
+        api.logger?.info(`sentry: registered service (mode=${api.registrationMode ?? "unknown"})`);
+        if (!api.on) {
+            api.logger?.warn(`sentry: model_call_ended hook registration skipped; plugin API does not expose typed hooks (mode=${api.registrationMode ?? "unknown"})`);
+            return;
+        }
+        api.on("model_call_ended", (event, ctx) => {
             try {
                 recordModelCallHook(event, ctx);
             }
@@ -319,5 +323,6 @@ export default definePluginEntry({
                 // Keep hook failures non-fatal; Sentry telemetry must not affect replies.
             }
         }, { timeoutMs: 5000 });
+        api.logger?.info("sentry: registered model_call_ended hook");
     },
 });

@@ -136,6 +136,11 @@ type OpenClawPluginService = {
 };
 
 type OpenClawPluginApi = {
+	registrationMode?: string;
+	logger?: {
+		info(message: string): void;
+		warn(message: string): void;
+	};
 	registerService(service: OpenClawPluginService): void;
 	on?(
 		hookName: "model_call_ended",
@@ -537,10 +542,18 @@ export default definePluginEntry({
 	name: "Sentry",
 	description:
 		"Send errors, logs, and traces from your OpenClaw instance to Sentry",
-	kind: "service",
 	register(api: OpenClawPluginApi) {
 		api.registerService(createSentryService());
-		api.on?.(
+		api.logger?.info(
+			`sentry: registered service (mode=${api.registrationMode ?? "unknown"})`,
+		);
+		if (!api.on) {
+			api.logger?.warn(
+				`sentry: model_call_ended hook registration skipped; plugin API does not expose typed hooks (mode=${api.registrationMode ?? "unknown"})`,
+			);
+			return;
+		}
+		api.on(
 			"model_call_ended",
 			(event, ctx) => {
 				try {
@@ -551,5 +564,6 @@ export default definePluginEntry({
 			},
 			{ timeoutMs: 5000 },
 		);
+		api.logger?.info("sentry: registered model_call_ended hook");
 	},
 });
