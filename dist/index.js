@@ -2,7 +2,9 @@ import { _INTERNAL_flushLogsBuffer } from "@sentry/core";
 import * as Sentry from "@sentry/node";
 import { onInternalDiagnosticEvent } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-const activeModelCallSpans = new Map();
+const activeModelCalls = new Map();
+const pendingTraceEnvelopes = new Set();
+let sentryEnvelopeConfig = null;
 export function createSentryService() {
     let unsubDiag = null;
     let telemetryFlushInterval = null;
@@ -14,19 +16,26 @@ export function createSentryService() {
             const entries = ctx.config.plugins?.entries;
             const pluginCfg = entries?.sentry?.config;
             const dsn = pluginCfg?.dsn;
+            const environment = pluginCfg?.environment ?? "production";
             if (!dsn) {
                 ctx.logger.warn("sentry: no DSN configured — skipping init");
                 return;
             }
+            const envelopeConfig = resolveSentryEnvelopeConfig(dsn, environment);
+            if (!envelopeConfig) {
+                ctx.logger.warn("sentry: invalid DSN configured — skipping init");
+                return;
+            }
+            sentryEnvelopeConfig = envelopeConfig;
             // ── 1. Init Sentry SDK ──────────────────────────────────
             const enableLogs = pluginCfg?.enableLogs !== false; // default true
             Sentry.init({
                 dsn,
-                environment: pluginCfg?.environment ?? "production",
+                environment,
                 tracesSampleRate: pluginCfg?.tracesSampleRate ?? 1.0,
                 enableLogs, // top-level in Sentry SDK v10+
             });
-            ctx.logger.info(`sentry: initialized (dsn=...${dsn.slice(-12)}, env=${pluginCfg?.environment ?? "production"}, logs=${enableLogs})`);
+            ctx.logger.info(`sentry: initialized (dsn=...${dsn.slice(-12)}, env=${environment}, logs=${enableLogs})`);
             // ── 2. Diagnostic events → Sentry spans + messages ─────
             const handleEvent = (evt, metadata = {}) => {
                 try {
@@ -66,13 +75,15 @@ export function createSentryService() {
         async stop() {
             unsubDiag?.();
             unsubDiag = null;
-            endActiveModelCallSpans();
+            endActiveModelCalls();
             if (telemetryFlushInterval) {
                 clearInterval(telemetryFlushInterval);
                 telemetryFlushInterval = null;
             }
             flushSentryLogs();
+            await flushTraceEnvelopes(5000);
             await Sentry.flush(5000).catch(() => undefined);
+            sentryEnvelopeConfig = null;
         },
     };
 }
@@ -117,20 +128,16 @@ function handleDiagnosticEvent(evt, _metadata = {}) {
 }
 // ── Model usage → ai.chat span with real duration ───────────
 function recordModelUsage(evt) {
-    withDiagnosticTrace(evt.trace, () => {
-        recordModelUsageSpan(evt);
-    });
-}
-function recordModelUsageSpan(evt) {
     const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
     const startTimeMs = endTimeMs - durationMs;
-    const span = startTelemetrySegment({
-        op: "ai.chat",
+    captureTransactionEnvelope({
         name: spanName,
-        startTime: startTimeMs,
-        forceTransaction: true,
+        op: "ai.chat",
+        trace: evt.trace,
+        startTimeMs,
+        endTimeMs,
         attributes: {
             // GenAI semantic conventions (OpenTelemetry)
             "gen_ai.operation.name": "chat",
@@ -148,73 +155,70 @@ function recordModelUsageSpan(evt) {
             "openclaw.duration_ms": durationMs,
         },
     });
-    span?.end(endTimeMs);
 }
 // ── Model call lifecycle → ai.chat transaction ──────────────
 function recordModelCallStarted(evt) {
     const key = modelCallSpanKey(evt);
     if (!key)
         return;
-    withDiagnosticTrace(parentTraceContext(evt.trace), () => {
-        const span = startTelemetrySegment({
-            op: "ai.chat",
-            name: modelCallSpanName(evt),
-            startTime: evt.ts,
-            forceTransaction: true,
-            attributes: modelCallAttributes(evt, { outcome: "started" }),
-        });
-        activeModelCallSpans.set(key, span);
+    activeModelCalls.set(key, {
+        name: modelCallSpanName(evt),
+        op: "ai.chat",
+        startTimeMs: evt.ts,
+        trace: evt.trace,
+        attributes: modelCallAttributes(evt, { outcome: "started" }),
     });
 }
 function recordModelCall(evt) {
     const key = modelCallSpanKey(evt);
-    const activeSpan = key ? activeModelCallSpans.get(key) : undefined;
-    if (key && activeSpan) {
-        activeModelCallSpans.delete(key);
-        finishModelCallSpan(activeSpan, evt);
+    const activeCall = key ? activeModelCalls.get(key) : undefined;
+    if (key && activeCall) {
+        activeModelCalls.delete(key);
+        finishModelCallTransaction(activeCall, evt);
         return;
     }
-    withDiagnosticTrace(evt.trace, () => {
-        recordModelCallSpan(evt);
+    recordModelCallTransaction(evt);
+}
+function finishModelCallTransaction(activeCall, evt) {
+    const durationMs = evt.durationMs ?? 100;
+    captureTransactionEnvelope({
+        name: activeCall.name,
+        op: activeCall.op,
+        trace: evt.trace ?? activeCall.trace,
+        startTimeMs: activeCall.startTimeMs,
+        endTimeMs: evt.ts,
+        status: evt.type === "model.call.error" ? "internal_error" : "ok",
+        statusMessage: evt.type === "model.call.error"
+            ? (evt.failureKind ?? evt.errorCategory ?? "model call error")
+            : undefined,
+        attributes: {
+            ...activeCall.attributes,
+            ...modelCallAttributes(evt, {
+                durationMs,
+                outcome: evt.type === "model.call.error" ? "error" : "completed",
+            }),
+        },
     });
 }
-function finishModelCallSpan(span, evt) {
-    const durationMs = evt.durationMs ?? 100;
-    span.setAttributes?.(modelCallAttributes(evt, {
-        durationMs,
-        outcome: evt.type === "model.call.error" ? "error" : "completed",
-    }));
-    if (evt.type === "model.call.error") {
-        span.setStatus({
-            code: 2,
-            message: evt.failureKind ?? evt.errorCategory ?? "model call error",
-        });
-    }
-    span.end(evt.ts);
-}
-function recordModelCallSpan(evt) {
+function recordModelCallTransaction(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
     const startTimeMs = endTimeMs - durationMs;
-    const span = startTelemetrySegment({
-        op: "ai.chat",
+    captureTransactionEnvelope({
         name: modelCallSpanName(evt),
-        startTime: startTimeMs,
-        forceTransaction: true,
+        op: "ai.chat",
+        trace: evt.trace,
+        startTimeMs,
+        endTimeMs,
+        status: evt.type === "model.call.error" ? "internal_error" : "ok",
+        statusMessage: evt.type === "model.call.error"
+            ? (evt.failureKind ?? evt.errorCategory ?? "model call error")
+            : undefined,
         attributes: modelCallAttributes(evt, {
             durationMs,
             outcome: evt.type === "model.call.error" ? "error" : "completed",
         }),
     });
-    if (span) {
-        if (evt.type === "model.call.error") {
-            span.setStatus({
-                code: 2,
-                message: evt.failureKind ?? evt.errorCategory ?? "model call error",
-            });
-        }
-        span.end(endTimeMs);
-    }
 }
 function modelCallSpanName(evt) {
     return evt.model ? `model call ${evt.model}` : "model call unknown";
@@ -283,37 +287,38 @@ function modelCallSpanKey(evt) {
         return `${evt.runId}:${evt.callId}`;
     return evt.trace?.spanId;
 }
-function parentTraceContext(trace) {
-    if (!trace?.traceId || !trace.parentSpanId)
-        return undefined;
-    return {
-        traceId: trace.traceId,
-        spanId: trace.parentSpanId,
-        traceFlags: trace.traceFlags,
-    };
-}
-function endActiveModelCallSpans() {
+function endActiveModelCalls() {
     const endTimeMs = Date.now();
-    for (const span of activeModelCallSpans.values()) {
-        span.end(endTimeMs);
+    for (const activeCall of activeModelCalls.values()) {
+        captureTransactionEnvelope({
+            name: activeCall.name,
+            op: activeCall.op,
+            trace: activeCall.trace,
+            startTimeMs: activeCall.startTimeMs,
+            endTimeMs,
+            status: "deadline_exceeded",
+            statusMessage: "model call span ended during plugin stop",
+            attributes: {
+                ...activeCall.attributes,
+                "openclaw.outcome": "interrupted",
+            },
+        });
     }
-    activeModelCallSpans.clear();
+    activeModelCalls.clear();
 }
 // ── Message processed → openclaw.message span ───────────────
 function recordMessageDispatchCompleted(evt) {
-    withDiagnosticTrace(evt.trace, () => {
-        recordMessageDispatchCompletedSpan(evt);
-    });
-}
-function recordMessageDispatchCompletedSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs;
     const startTimeMs = endTimeMs - durationMs;
-    const span = startTelemetrySegment({
-        op: "openclaw.message.dispatch",
+    captureTransactionEnvelope({
         name: `message.dispatch.${evt.outcome}`,
-        startTime: startTimeMs,
-        forceTransaction: true,
+        op: "openclaw.message.dispatch",
+        trace: evt.trace,
+        startTimeMs,
+        endTimeMs,
+        status: evt.outcome === "error" ? "internal_error" : "ok",
+        statusMessage: evt.outcome === "error" ? evt.error : undefined,
         attributes: {
             "openclaw.channel": evt.channel ?? "unknown",
             "openclaw.outcome": evt.outcome,
@@ -324,39 +329,28 @@ function recordMessageDispatchCompletedSpan(evt) {
             "openclaw.duration_ms": durationMs,
         },
     });
-    if (span) {
-        if (evt.outcome === "error") {
-            span.setStatus({
-                code: 2,
-                message: evt.error ?? "message dispatch error",
-            });
-            if (evt.error) {
-                Sentry.captureMessage(`Message dispatch error: ${evt.error}`, {
-                    level: "error",
-                    tags: {
-                        channel: evt.channel ?? "unknown",
-                        sessionKey: evt.sessionKey,
-                    },
-                });
-            }
-        }
-        span.end(endTimeMs);
+    if (evt.outcome === "error" && evt.error) {
+        Sentry.captureMessage(`Message dispatch error: ${evt.error}`, {
+            level: "error",
+            tags: {
+                channel: evt.channel ?? "unknown",
+                sessionKey: evt.sessionKey,
+            },
+        });
     }
 }
 function recordMessageProcessed(evt) {
-    withDiagnosticTrace(evt.trace, () => {
-        recordMessageProcessedSpan(evt);
-    });
-}
-function recordMessageProcessedSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 50;
     const startTimeMs = endTimeMs - durationMs;
-    const span = startTelemetrySegment({
-        op: "openclaw.message",
+    captureTransactionEnvelope({
         name: `message.${evt.outcome}`,
-        startTime: startTimeMs,
-        forceTransaction: true,
+        op: "openclaw.message",
+        trace: evt.trace,
+        startTimeMs,
+        endTimeMs,
+        status: evt.outcome === "error" ? "internal_error" : "ok",
+        statusMessage: evt.outcome === "error" ? evt.error : undefined,
         attributes: {
             "openclaw.channel": evt.channel,
             "openclaw.outcome": evt.outcome,
@@ -366,43 +360,131 @@ function recordMessageProcessedSpan(evt) {
             "openclaw.duration_ms": durationMs,
         },
     });
-    if (span) {
-        if (evt.outcome === "error") {
-            span.setStatus({ code: 2, message: evt.error ?? "unknown error" });
-            if (evt.error) {
-                Sentry.captureMessage(`Message processing error: ${evt.error}`, {
-                    level: "error",
-                    tags: { channel: evt.channel, sessionKey: evt.sessionKey },
-                });
-            }
-        }
-        span.end(endTimeMs);
+    if (evt.outcome === "error" && evt.error) {
+        Sentry.captureMessage(`Message processing error: ${evt.error}`, {
+            level: "error",
+            tags: { channel: evt.channel, sessionKey: evt.sessionKey },
+        });
     }
 }
-function startTelemetrySegment(options) {
-    return Sentry.startSpanManual({
-        parentSpan: null,
-        forceTransaction: true,
-        ...options,
-        experimental: {
-            ...options.experimental,
-            standalone: true,
-        },
-    }, (span) => span);
+// ── Sentry transaction envelopes ────────────────────────────
+function resolveSentryEnvelopeConfig(dsn, environment) {
+    try {
+        const url = new URL(dsn);
+        const projectId = url.pathname.split("/").filter(Boolean).at(-1);
+        if (!projectId)
+            return null;
+        return {
+            dsn,
+            endpoint: `${url.protocol}//${url.host}/api/${projectId}/envelope/`,
+            environment,
+        };
+    }
+    catch {
+        return null;
+    }
 }
-function withDiagnosticTrace(trace, fn) {
-    const sentryTrace = formatSentryTraceHeader(trace);
-    if (!sentryTrace) {
-        fn();
+function captureTransactionEnvelope(options) {
+    const config = sentryEnvelopeConfig;
+    if (!config)
         return;
-    }
-    Sentry.continueTrace({ sentryTrace, baggage: undefined }, fn);
+    const eventId = randomHex(16);
+    const traceId = validTraceId(options.trace?.traceId)
+        ? options.trace.traceId
+        : randomHex(16);
+    const spanId = validSpanId(options.trace?.spanId)
+        ? options.trace.spanId
+        : randomHex(8);
+    const parentSpanId = validSpanId(options.trace?.parentSpanId)
+        ? options.trace.parentSpanId
+        : undefined;
+    const startTimestamp = toSentryTimestamp(options.startTimeMs);
+    const endTimestamp = Math.max(startTimestamp, toSentryTimestamp(options.endTimeMs));
+    const attributes = options.attributes ?? {};
+    const event = {
+        event_id: eventId,
+        type: "transaction",
+        transaction: options.name,
+        platform: "node",
+        environment: config.environment,
+        start_timestamp: startTimestamp,
+        timestamp: endTimestamp,
+        contexts: {
+            trace: {
+                trace_id: traceId,
+                span_id: spanId,
+                ...(parentSpanId ? { parent_span_id: parentSpanId } : {}),
+                op: options.op,
+                status: options.status ?? "ok",
+                ...(Object.keys(attributes).length > 0 ? { data: attributes } : {}),
+            },
+            openclaw: attributes,
+        },
+        transaction_info: { source: "custom" },
+        tags: transactionTags(attributes),
+        spans: [],
+        ...(options.statusMessage ? { message: options.statusMessage } : {}),
+    };
+    const envelope = `${JSON.stringify({
+        dsn: config.dsn,
+        sent_at: new Date().toISOString(),
+    })}\n${JSON.stringify({ type: "transaction" })}\n${JSON.stringify(event)}\n`;
+    const pending = fetch(config.endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/x-sentry-envelope" },
+        body: envelope,
+    })
+        .then(async (res) => {
+        if (!res.ok) {
+            throw new Error(`Sentry transaction envelope rejected (${res.status})`);
+        }
+    })
+        .catch(() => undefined)
+        .finally(() => {
+        pendingTraceEnvelopes.delete(pending);
+    });
+    pendingTraceEnvelopes.add(pending);
 }
-function formatSentryTraceHeader(trace) {
-    if (!trace?.traceId || !trace.spanId)
-        return undefined;
-    const sampled = trace.traceFlags === "00" ? "0" : "1";
-    return `${trace.traceId}-${trace.spanId}-${sampled}`;
+function transactionTags(attributes) {
+    const tags = {};
+    for (const key of [
+        "openclaw.channel",
+        "openclaw.outcome",
+        "openclaw.provider",
+        "openclaw.model",
+        "gen_ai.operation.name",
+    ]) {
+        const value = attributes[key];
+        if (value !== undefined)
+            tags[key] = String(value).slice(0, 200);
+    }
+    return tags;
+}
+function toSentryTimestamp(timeMs) {
+    return timeMs > 9_999_999_999 ? timeMs / 1000 : timeMs;
+}
+function validTraceId(value) {
+    return typeof value === "string" && /^[a-f0-9]{32}$/i.test(value);
+}
+function validSpanId(value) {
+    return typeof value === "string" && /^[a-f0-9]{16}$/i.test(value);
+}
+function randomHex(bytes) {
+    let value = "";
+    for (let i = 0; i < bytes; i += 1) {
+        value += Math.floor(Math.random() * 256)
+            .toString(16)
+            .padStart(2, "0");
+    }
+    return value;
+}
+async function flushTraceEnvelopes(timeoutMs) {
+    if (pendingTraceEnvelopes.size === 0)
+        return;
+    await Promise.race([
+        Promise.allSettled([...pendingTraceEnvelopes]),
+        new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
 }
 // ── Diagnostic log records → Sentry structured logs ──────────
 function forwardLogRecord(evt) {
@@ -457,6 +539,7 @@ async function flushSentryTelemetry(getFlushInFlight, setFlushInFlight) {
     setFlushInFlight(true);
     try {
         flushSentryLogs();
+        await flushTraceEnvelopes(5000);
         await Sentry.flush(5000);
     }
     catch {
