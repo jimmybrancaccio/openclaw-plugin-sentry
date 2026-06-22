@@ -5,6 +5,15 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 
 type DiagnosticEventPayload =
 	| {
+			type: "model.call.started";
+			ts: number;
+			trace?: DiagnosticTraceContext;
+			provider?: string;
+			model?: string;
+			api?: string;
+			transport?: string;
+	  }
+	| {
 			type: "model.usage";
 			ts: number;
 			trace?: DiagnosticTraceContext;
@@ -46,6 +55,9 @@ type DiagnosticEventPayload =
 			requestPayloadBytes?: number;
 			responseStreamBytes?: number;
 			timeToFirstByteMs?: number;
+			api?: string;
+			transport?: string;
+			upstreamRequestIdHash?: string;
 	  }
 	| {
 			type: "model.call.error";
@@ -61,6 +73,9 @@ type DiagnosticEventPayload =
 			timeToFirstByteMs?: number;
 			errorCategory?: string;
 			failureKind?: string;
+			api?: string;
+			transport?: string;
+			upstreamRequestIdHash?: string;
 	  }
 	| {
 			type: "webhook.error";
@@ -87,34 +102,15 @@ type DiagnosticEventPayload =
 			};
 	  };
 
-type ModelCallEndedHookEvent = {
-	runId: string;
-	callId: string;
-	sessionKey?: string;
-	sessionId?: string;
-	provider: string;
-	model: string;
-	durationMs: number;
-	outcome: "completed" | "error";
-	errorCategory?: string;
-	failureKind?: string;
-	requestPayloadBytes?: number;
-	responseStreamBytes?: number;
-	timeToFirstByteMs?: number;
-};
-
-type PluginHookAgentContext = {
-	trace?: DiagnosticTraceContext;
-	channel?: string;
-	sessionKey?: string;
-	sessionId?: string;
-};
-
 type DiagnosticTraceContext = {
 	traceId?: string;
 	spanId?: string;
 	parentSpanId?: string;
 	traceFlags?: string;
+};
+
+type DiagnosticEventMetadata = {
+	trusted?: boolean;
 };
 
 type OpenClawPluginContext = {
@@ -126,6 +122,15 @@ type OpenClawPluginContext = {
 		plugins?: {
 			entries?: Record<string, { config?: Record<string, unknown> }>;
 		};
+	};
+	internalDiagnostics?: {
+		onEvent(
+			handler: (
+				event: DiagnosticEventPayload,
+				metadata: DiagnosticEventMetadata,
+				privateData: unknown,
+			) => void,
+		): () => void;
 	};
 };
 
@@ -142,15 +147,11 @@ type OpenClawPluginApi = {
 		warn(message: string): void;
 	};
 	registerService(service: OpenClawPluginService): void;
-	on?(
-		hookName: "model_call_ended",
-		handler: (
-			event: ModelCallEndedHookEvent,
-			ctx: PluginHookAgentContext,
-		) => Promise<void> | void,
-		opts?: { priority?: number; timeoutMs?: number },
-	): void;
 };
+
+type SentrySpan = ReturnType<typeof Sentry.startInactiveSpan>;
+
+const activeModelCallSpans = new Map<string, SentrySpan>();
 
 export function createSentryService(): OpenClawPluginService {
 	let unsubDiag: (() => void) | null = null;
@@ -194,18 +195,31 @@ export function createSentryService(): OpenClawPluginService {
 			);
 
 			// ── 2. Diagnostic events → Sentry spans + messages ─────
-			unsubDiag = onInternalDiagnosticEvent((evt: DiagnosticEventPayload) => {
+			const handleEvent = (
+				evt: DiagnosticEventPayload,
+				metadata: DiagnosticEventMetadata = {},
+			) => {
 				try {
 					if (evt.type === "log.record") {
 						if (enableLogs) forwardLogRecord(evt);
 						return;
 					}
-					handleDiagnosticEvent(evt);
+					handleDiagnosticEvent(evt, metadata);
 				} catch {
 					// Don't let telemetry errors affect the gateway
 				}
-			});
-			ctx.logger.info("sentry: subscribed to diagnostic events");
+			};
+			if (ctx.internalDiagnostics?.onEvent) {
+				unsubDiag = ctx.internalDiagnostics.onEvent((evt, metadata) => {
+					handleEvent(evt, metadata);
+				});
+				ctx.logger.info("sentry: subscribed to internal diagnostic events");
+			} else {
+				unsubDiag = onInternalDiagnosticEvent((evt: DiagnosticEventPayload) => {
+					handleEvent(evt);
+				});
+				ctx.logger.info("sentry: subscribed to diagnostic events");
+			}
 
 			if (enableLogs) {
 				ctx.logger.info("sentry: subscribed to diagnostic log records");
@@ -224,6 +238,7 @@ export function createSentryService(): OpenClawPluginService {
 		async stop() {
 			unsubDiag?.();
 			unsubDiag = null;
+			endActiveModelCallSpans();
 			if (telemetryFlushInterval) {
 				clearInterval(telemetryFlushInterval);
 				telemetryFlushInterval = null;
@@ -236,8 +251,14 @@ export function createSentryService(): OpenClawPluginService {
 
 // ── Diagnostic events → spans / messages ────────────────────
 
-function handleDiagnosticEvent(evt: DiagnosticEventPayload): void {
+function handleDiagnosticEvent(
+	evt: DiagnosticEventPayload,
+	metadata: DiagnosticEventMetadata = {},
+): void {
 	switch (evt.type) {
+		case "model.call.started":
+			recordModelCallStarted(evt, metadata);
+			return;
 		case "model.usage":
 			recordModelUsage(evt);
 			return;
@@ -245,10 +266,10 @@ function handleDiagnosticEvent(evt: DiagnosticEventPayload): void {
 			recordMessageProcessed(evt);
 			return;
 		case "model.call.completed":
-			recordModelCall(evt);
+			recordModelCall(evt, metadata);
 			return;
 		case "model.call.error":
-			recordModelCall(evt);
+			recordModelCall(evt, metadata);
 			return;
 		case "webhook.error":
 			Sentry.captureMessage(`Webhook error: ${evt.error}`, {
@@ -319,15 +340,67 @@ function recordModelUsageSpan(
 
 // ── Model call lifecycle → ai.chat transaction ──────────────
 
+function recordModelCallStarted(
+	evt: Extract<DiagnosticEventPayload, { type: "model.call.started" }>,
+	metadata: DiagnosticEventMetadata,
+): void {
+	if (!metadata.trusted) return;
+	const key = modelCallSpanKey(evt);
+	if (!key) return;
+
+	withDiagnosticTrace(parentTraceContext(evt.trace), () => {
+		const span = Sentry.startInactiveSpan({
+			op: "ai.chat",
+			name: modelCallSpanName(evt),
+			startTime: evt.ts,
+			forceTransaction: true,
+			attributes: modelCallAttributes(evt, { outcome: "started" }),
+		});
+		activeModelCallSpans.set(key, span);
+	});
+}
+
 function recordModelCall(
 	evt: Extract<
 		DiagnosticEventPayload,
 		{ type: "model.call.completed" | "model.call.error" }
 	>,
+	metadata: DiagnosticEventMetadata,
 ): void {
+	const key = metadata.trusted ? modelCallSpanKey(evt) : undefined;
+	const activeSpan = key ? activeModelCallSpans.get(key) : undefined;
+	if (key && activeSpan) {
+		activeModelCallSpans.delete(key);
+		finishModelCallSpan(activeSpan, evt);
+		return;
+	}
+
 	withDiagnosticTrace(evt.trace, () => {
 		recordModelCallSpan(evt);
 	});
+}
+
+function finishModelCallSpan(
+	span: SentrySpan,
+	evt: Extract<
+		DiagnosticEventPayload,
+		{ type: "model.call.completed" | "model.call.error" }
+	>,
+): void {
+	const durationMs = evt.durationMs ?? 100;
+	span.setAttributes?.(
+		modelCallAttributes(evt, {
+			durationMs,
+			outcome: evt.type === "model.call.error" ? "error" : "completed",
+		}),
+	);
+	if (evt.type === "model.call.error") {
+		span.setStatus({
+			code: 2,
+			message: evt.failureKind ?? evt.errorCategory ?? "model call error",
+		});
+	}
+	span.end(evt.ts);
 }
 
 function recordModelCallSpan(
@@ -336,33 +409,19 @@ function recordModelCallSpan(
 		{ type: "model.call.completed" | "model.call.error" }
 	>,
 ): void {
-	const spanName = evt.model ? `model call ${evt.model}` : "model call unknown";
 	const endTimeMs = evt.ts;
 	const durationMs = evt.durationMs ?? 100;
 	const startTimeMs = endTimeMs - durationMs;
 
 	const span = Sentry.startInactiveSpan({
 		op: "ai.chat",
-		name: spanName,
+		name: modelCallSpanName(evt),
 		startTime: startTimeMs,
 		forceTransaction: true,
-		attributes: {
-			"gen_ai.operation.name": "chat",
-			"gen_ai.system": evt.provider ?? "unknown",
-			"gen_ai.request.model": evt.model ?? "unknown",
-			"openclaw.channel": evt.channel ?? "unknown",
-			"openclaw.session_key": evt.sessionKey ?? "unknown",
-			"openclaw.duration_ms": durationMs,
-			"openclaw.request_payload_bytes": evt.requestPayloadBytes ?? 0,
-			"openclaw.response_stream_bytes": evt.responseStreamBytes ?? 0,
-			"openclaw.time_to_first_byte_ms": evt.timeToFirstByteMs ?? 0,
-			"openclaw.outcome":
-				evt.type === "model.call.error" ? "error" : "completed",
-			"openclaw.error_category":
-				evt.type === "model.call.error" ? (evt.errorCategory ?? "unknown") : "",
-			"openclaw.failure_kind":
-				evt.type === "model.call.error" ? (evt.failureKind ?? "unknown") : "",
-		},
+		attributes: modelCallAttributes(evt, {
+			durationMs,
+			outcome: evt.type === "model.call.error" ? "error" : "completed",
+		}),
 	});
 
 	if (span) {
@@ -376,25 +435,101 @@ function recordModelCallSpan(
 	}
 }
 
-function recordModelCallHook(
-	evt: ModelCallEndedHookEvent,
-	ctx: PluginHookAgentContext,
-): void {
-	recordModelCallSpan({
-		type: evt.outcome === "error" ? "model.call.error" : "model.call.completed",
-		ts: Date.now(),
-		trace: ctx.trace,
-		durationMs: evt.durationMs,
-		provider: evt.provider,
-		model: evt.model,
-		channel: ctx.channel,
-		sessionKey: evt.sessionKey ?? ctx.sessionKey,
-		requestPayloadBytes: evt.requestPayloadBytes,
-		responseStreamBytes: evt.responseStreamBytes,
-		timeToFirstByteMs: evt.timeToFirstByteMs,
-		errorCategory: evt.errorCategory,
-		failureKind: evt.failureKind,
-	});
+function modelCallSpanName(
+	evt: Extract<
+		DiagnosticEventPayload,
+		{
+			type: "model.call.started" | "model.call.completed" | "model.call.error";
+		}
+	>,
+): string {
+	return evt.model ? `model call ${evt.model}` : "model call unknown";
+}
+
+function modelCallAttributes(
+	evt: Extract<
+		DiagnosticEventPayload,
+		{
+			type: "model.call.started" | "model.call.completed" | "model.call.error";
+		}
+	>,
+	options: { durationMs?: number; outcome: string },
+): Record<string, string | number | boolean> {
+	const attrs: Record<string, string | number | boolean> = {
+		"gen_ai.operation.name": genAiOperationName(evt.api),
+		"gen_ai.system": evt.provider ?? "unknown",
+		"gen_ai.request.model": evt.model ?? "unknown",
+		"openclaw.provider": evt.provider ?? "unknown",
+		"openclaw.model": evt.model ?? "unknown",
+		"openclaw.outcome": options.outcome,
+	};
+	if ("channel" in evt) attrs["openclaw.channel"] = evt.channel ?? "unknown";
+	if ("sessionKey" in evt) {
+		attrs["openclaw.session_key"] = evt.sessionKey ?? "unknown";
+	}
+	if (evt.api) attrs["openclaw.api"] = evt.api;
+	if (evt.transport) attrs["openclaw.transport"] = evt.transport;
+	if (options.durationMs !== undefined) {
+		attrs["openclaw.duration_ms"] = options.durationMs;
+	}
+	if ("requestPayloadBytes" in evt && evt.requestPayloadBytes !== undefined) {
+		attrs["openclaw.request_payload_bytes"] = evt.requestPayloadBytes;
+	}
+	if ("responseStreamBytes" in evt && evt.responseStreamBytes !== undefined) {
+		attrs["openclaw.response_stream_bytes"] = evt.responseStreamBytes;
+	}
+	if ("timeToFirstByteMs" in evt && evt.timeToFirstByteMs !== undefined) {
+		attrs["openclaw.time_to_first_byte_ms"] = evt.timeToFirstByteMs;
+	}
+	if ("upstreamRequestIdHash" in evt && evt.upstreamRequestIdHash) {
+		attrs["openclaw.upstream_request_id_hash"] = evt.upstreamRequestIdHash;
+	}
+	if (evt.type === "model.call.error") {
+		attrs["openclaw.error_category"] = evt.errorCategory ?? "unknown";
+		attrs["openclaw.failure_kind"] = evt.failureKind ?? "unknown";
+		attrs["error.type"] = evt.errorCategory ?? "unknown";
+	}
+	return attrs;
+}
+
+function genAiOperationName(api: string | undefined): string {
+	const normalized = api?.trim().toLowerCase();
+	if (!normalized) return "chat";
+	if (normalized === "completions" || normalized.endsWith("-completions")) {
+		return "text_completion";
+	}
+	if (
+		normalized === "generate_content" ||
+		normalized.includes("generative-ai")
+	) {
+		return "generate_content";
+	}
+	return "chat";
+}
+
+function modelCallSpanKey(evt: {
+	trace?: DiagnosticTraceContext;
+}): string | undefined {
+	return evt.trace?.spanId;
+}
+
+function parentTraceContext(
+	trace: DiagnosticTraceContext | undefined,
+): DiagnosticTraceContext | undefined {
+	if (!trace?.traceId || !trace.parentSpanId) return undefined;
+	return {
+		traceId: trace.traceId,
+		spanId: trace.parentSpanId,
+		traceFlags: trace.traceFlags,
+	};
+}
+
+function endActiveModelCallSpans(): void {
+	const endTimeMs = Date.now();
+	for (const span of activeModelCallSpans.values()) {
+		span.end(endTimeMs);
+	}
+	activeModelCallSpans.clear();
 }
 
 // ── Message processed → openclaw.message span ───────────────
@@ -547,23 +682,5 @@ export default definePluginEntry({
 		api.logger?.info(
 			`sentry: registered service (mode=${api.registrationMode ?? "unknown"})`,
 		);
-		if (!api.on) {
-			api.logger?.warn(
-				`sentry: model_call_ended hook registration skipped; plugin API does not expose typed hooks (mode=${api.registrationMode ?? "unknown"})`,
-			);
-			return;
-		}
-		api.on(
-			"model_call_ended",
-			(event, ctx) => {
-				try {
-					recordModelCallHook(event, ctx);
-				} catch {
-					// Keep hook failures non-fatal; Sentry telemetry must not affect replies.
-				}
-			},
-			{ timeoutMs: 5000 },
-		);
-		api.logger?.info("sentry: registered model_call_ended hook");
 	},
 });
