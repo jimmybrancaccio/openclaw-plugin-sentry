@@ -35,7 +35,6 @@ export function createSentryService() {
                             forwardLogRecord(evt);
                         return;
                     }
-                    ctx.logger.info(`sentry: diagnostic event ${evt.type}`);
                     handleDiagnosticEvent(evt, metadata);
                 }
                 catch {
@@ -78,10 +77,10 @@ export function createSentryService() {
     };
 }
 // ── Diagnostic events → spans / messages ────────────────────
-function handleDiagnosticEvent(evt, metadata = {}) {
+function handleDiagnosticEvent(evt, _metadata = {}) {
     switch (evt.type) {
         case "model.call.started":
-            recordModelCallStarted(evt, metadata);
+            recordModelCallStarted(evt);
             return;
         case "model.usage":
             recordModelUsage(evt);
@@ -89,11 +88,14 @@ function handleDiagnosticEvent(evt, metadata = {}) {
         case "message.processed":
             recordMessageProcessed(evt);
             return;
+        case "message.dispatch.completed":
+            recordMessageDispatchCompleted(evt);
+            return;
         case "model.call.completed":
-            recordModelCall(evt, metadata);
+            recordModelCall(evt);
             return;
         case "model.call.error":
-            recordModelCall(evt, metadata);
+            recordModelCall(evt);
             return;
         case "webhook.error":
             Sentry.captureMessage(`Webhook error: ${evt.error}`, {
@@ -150,9 +152,7 @@ function recordModelUsageSpan(evt) {
     span?.end(endTimeMs);
 }
 // ── Model call lifecycle → ai.chat transaction ──────────────
-function recordModelCallStarted(evt, metadata) {
-    if (!metadata.trusted)
-        return;
+function recordModelCallStarted(evt) {
     const key = modelCallSpanKey(evt);
     if (!key)
         return;
@@ -167,8 +167,8 @@ function recordModelCallStarted(evt, metadata) {
         activeModelCallSpans.set(key, span);
     });
 }
-function recordModelCall(evt, metadata) {
-    const key = metadata.trusted ? modelCallSpanKey(evt) : undefined;
+function recordModelCall(evt) {
+    const key = modelCallSpanKey(evt);
     const activeSpan = key ? activeModelCallSpans.get(key) : undefined;
     if (key && activeSpan) {
         activeModelCallSpans.delete(key);
@@ -229,6 +229,12 @@ function modelCallAttributes(evt, options) {
         "openclaw.model": evt.model ?? "unknown",
         "openclaw.outcome": options.outcome,
     };
+    if (evt.runId)
+        attrs["openclaw.run_id"] = evt.runId;
+    if (evt.callId)
+        attrs["openclaw.call_id"] = evt.callId;
+    if ("sessionId" in evt)
+        attrs["openclaw.session_id"] = evt.sessionId ?? "";
     if ("channel" in evt)
         attrs["openclaw.channel"] = evt.channel ?? "unknown";
     if ("sessionKey" in evt) {
@@ -274,6 +280,8 @@ function genAiOperationName(api) {
     return "chat";
 }
 function modelCallSpanKey(evt) {
+    if (evt.runId && evt.callId)
+        return `${evt.runId}:${evt.callId}`;
     return evt.trace?.spanId;
 }
 function parentTraceContext(trace) {
@@ -293,6 +301,49 @@ function endActiveModelCallSpans() {
     activeModelCallSpans.clear();
 }
 // ── Message processed → openclaw.message span ───────────────
+function recordMessageDispatchCompleted(evt) {
+    withDiagnosticTrace(evt.trace, () => {
+        recordMessageDispatchCompletedSpan(evt);
+    });
+}
+function recordMessageDispatchCompletedSpan(evt) {
+    const endTimeMs = evt.ts;
+    const durationMs = evt.durationMs;
+    const startTimeMs = endTimeMs - durationMs;
+    const span = Sentry.startInactiveSpan({
+        op: "openclaw.message.dispatch",
+        name: `message.dispatch.${evt.outcome}`,
+        startTime: startTimeMs,
+        forceTransaction: true,
+        attributes: {
+            "openclaw.channel": evt.channel ?? "unknown",
+            "openclaw.outcome": evt.outcome,
+            "openclaw.reason": evt.reason ?? "",
+            "openclaw.source": evt.source,
+            "openclaw.session_key": evt.sessionKey ?? "unknown",
+            "openclaw.session_id": evt.sessionId ?? "",
+            "openclaw.duration_ms": durationMs,
+        },
+    });
+    if (span) {
+        if (evt.outcome === "error") {
+            span.setStatus({
+                code: 2,
+                message: evt.error ?? "message dispatch error",
+            });
+            if (evt.error) {
+                Sentry.captureMessage(`Message dispatch error: ${evt.error}`, {
+                    level: "error",
+                    tags: {
+                        channel: evt.channel ?? "unknown",
+                        sessionKey: evt.sessionKey,
+                    },
+                });
+            }
+        }
+        span.end(endTimeMs);
+    }
+}
 function recordMessageProcessed(evt) {
     withDiagnosticTrace(evt.trace, () => {
         recordMessageProcessedSpan(evt);

@@ -8,6 +8,10 @@ type DiagnosticEventPayload =
 			type: "model.call.started";
 			ts: number;
 			trace?: DiagnosticTraceContext;
+			runId?: string;
+			callId?: string;
+			sessionKey?: string;
+			sessionId?: string;
 			provider?: string;
 			model?: string;
 			api?: string;
@@ -44,9 +48,25 @@ type DiagnosticEventPayload =
 			messageId?: string | number;
 	  }
 	| {
+			type: "message.dispatch.completed";
+			ts: number;
+			trace?: DiagnosticTraceContext;
+			durationMs: number;
+			outcome: "completed" | "skipped" | "error";
+			reason?: string;
+			error?: string;
+			channel?: string;
+			sessionKey?: string;
+			sessionId?: string;
+			source: string;
+	  }
+	| {
 			type: "model.call.completed";
 			ts: number;
 			trace?: DiagnosticTraceContext;
+			runId?: string;
+			callId?: string;
+			sessionId?: string;
 			durationMs?: number;
 			provider?: string;
 			model?: string;
@@ -63,6 +83,9 @@ type DiagnosticEventPayload =
 			type: "model.call.error";
 			ts: number;
 			trace?: DiagnosticTraceContext;
+			runId?: string;
+			callId?: string;
+			sessionId?: string;
 			durationMs?: number;
 			provider?: string;
 			model?: string;
@@ -204,7 +227,6 @@ export function createSentryService(): OpenClawPluginService {
 						if (enableLogs) forwardLogRecord(evt);
 						return;
 					}
-					ctx.logger.info(`sentry: diagnostic event ${evt.type}`);
 					handleDiagnosticEvent(evt, metadata);
 				} catch {
 					// Don't let telemetry errors affect the gateway
@@ -254,11 +276,11 @@ export function createSentryService(): OpenClawPluginService {
 
 function handleDiagnosticEvent(
 	evt: DiagnosticEventPayload,
-	metadata: DiagnosticEventMetadata = {},
+	_metadata: DiagnosticEventMetadata = {},
 ): void {
 	switch (evt.type) {
 		case "model.call.started":
-			recordModelCallStarted(evt, metadata);
+			recordModelCallStarted(evt);
 			return;
 		case "model.usage":
 			recordModelUsage(evt);
@@ -266,11 +288,14 @@ function handleDiagnosticEvent(
 		case "message.processed":
 			recordMessageProcessed(evt);
 			return;
+		case "message.dispatch.completed":
+			recordMessageDispatchCompleted(evt);
+			return;
 		case "model.call.completed":
-			recordModelCall(evt, metadata);
+			recordModelCall(evt);
 			return;
 		case "model.call.error":
-			recordModelCall(evt, metadata);
+			recordModelCall(evt);
 			return;
 		case "webhook.error":
 			Sentry.captureMessage(`Webhook error: ${evt.error}`, {
@@ -343,9 +368,7 @@ function recordModelUsageSpan(
 
 function recordModelCallStarted(
 	evt: Extract<DiagnosticEventPayload, { type: "model.call.started" }>,
-	metadata: DiagnosticEventMetadata,
 ): void {
-	if (!metadata.trusted) return;
 	const key = modelCallSpanKey(evt);
 	if (!key) return;
 
@@ -366,9 +389,8 @@ function recordModelCall(
 		DiagnosticEventPayload,
 		{ type: "model.call.completed" | "model.call.error" }
 	>,
-	metadata: DiagnosticEventMetadata,
 ): void {
-	const key = metadata.trusted ? modelCallSpanKey(evt) : undefined;
+	const key = modelCallSpanKey(evt);
 	const activeSpan = key ? activeModelCallSpans.get(key) : undefined;
 	if (key && activeSpan) {
 		activeModelCallSpans.delete(key);
@@ -464,6 +486,9 @@ function modelCallAttributes(
 		"openclaw.model": evt.model ?? "unknown",
 		"openclaw.outcome": options.outcome,
 	};
+	if (evt.runId) attrs["openclaw.run_id"] = evt.runId;
+	if (evt.callId) attrs["openclaw.call_id"] = evt.callId;
+	if ("sessionId" in evt) attrs["openclaw.session_id"] = evt.sessionId ?? "";
 	if ("channel" in evt) attrs["openclaw.channel"] = evt.channel ?? "unknown";
 	if ("sessionKey" in evt) {
 		attrs["openclaw.session_key"] = evt.sessionKey ?? "unknown";
@@ -509,8 +534,11 @@ function genAiOperationName(api: string | undefined): string {
 }
 
 function modelCallSpanKey(evt: {
+	runId?: string;
+	callId?: string;
 	trace?: DiagnosticTraceContext;
 }): string | undefined {
+	if (evt.runId && evt.callId) return `${evt.runId}:${evt.callId}`;
 	return evt.trace?.spanId;
 }
 
@@ -534,6 +562,57 @@ function endActiveModelCallSpans(): void {
 }
 
 // ── Message processed → openclaw.message span ───────────────
+
+function recordMessageDispatchCompleted(
+	evt: Extract<DiagnosticEventPayload, { type: "message.dispatch.completed" }>,
+): void {
+	withDiagnosticTrace(evt.trace, () => {
+		recordMessageDispatchCompletedSpan(evt);
+	});
+}
+
+function recordMessageDispatchCompletedSpan(
+	evt: Extract<DiagnosticEventPayload, { type: "message.dispatch.completed" }>,
+): void {
+	const endTimeMs = evt.ts;
+	const durationMs = evt.durationMs;
+	const startTimeMs = endTimeMs - durationMs;
+
+	const span = Sentry.startInactiveSpan({
+		op: "openclaw.message.dispatch",
+		name: `message.dispatch.${evt.outcome}`,
+		startTime: startTimeMs,
+		forceTransaction: true,
+		attributes: {
+			"openclaw.channel": evt.channel ?? "unknown",
+			"openclaw.outcome": evt.outcome,
+			"openclaw.reason": evt.reason ?? "",
+			"openclaw.source": evt.source,
+			"openclaw.session_key": evt.sessionKey ?? "unknown",
+			"openclaw.session_id": evt.sessionId ?? "",
+			"openclaw.duration_ms": durationMs,
+		},
+	});
+
+	if (span) {
+		if (evt.outcome === "error") {
+			span.setStatus({
+				code: 2,
+				message: evt.error ?? "message dispatch error",
+			});
+			if (evt.error) {
+				Sentry.captureMessage(`Message dispatch error: ${evt.error}`, {
+					level: "error",
+					tags: {
+						channel: evt.channel ?? "unknown",
+						sessionKey: evt.sessionKey,
+					},
+				});
+			}
+		}
+		span.end(endTimeMs);
+	}
+}
 
 function recordMessageProcessed(
 	evt: Extract<DiagnosticEventPayload, { type: "message.processed" }>,
