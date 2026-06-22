@@ -173,6 +173,7 @@ type OpenClawPluginApi = {
 };
 
 type SentrySpan = ReturnType<typeof Sentry.startInactiveSpan>;
+type SentryStartSpanOptions = Parameters<typeof Sentry.startSpanManual>[0];
 
 const activeModelCallSpans = new Map<string, SentrySpan>();
 
@@ -337,8 +338,7 @@ function recordModelUsageSpan(
 	const durationMs = evt.durationMs ?? 100;
 	const startTimeMs = endTimeMs - durationMs;
 
-	// startInactiveSpan with explicit timestamps (Sentry v10 accepts ms)
-	const span = Sentry.startInactiveSpan({
+	const span = startTelemetrySegment({
 		op: "ai.chat",
 		name: spanName,
 		startTime: startTimeMs,
@@ -373,7 +373,7 @@ function recordModelCallStarted(
 	if (!key) return;
 
 	withDiagnosticTrace(parentTraceContext(evt.trace), () => {
-		const span = Sentry.startInactiveSpan({
+		const span = startTelemetrySegment({
 			op: "ai.chat",
 			name: modelCallSpanName(evt),
 			startTime: evt.ts,
@@ -436,7 +436,7 @@ function recordModelCallSpan(
 	const durationMs = evt.durationMs ?? 100;
 	const startTimeMs = endTimeMs - durationMs;
 
-	const span = Sentry.startInactiveSpan({
+	const span = startTelemetrySegment({
 		op: "ai.chat",
 		name: modelCallSpanName(evt),
 		startTime: startTimeMs,
@@ -578,7 +578,7 @@ function recordMessageDispatchCompletedSpan(
 	const durationMs = evt.durationMs;
 	const startTimeMs = endTimeMs - durationMs;
 
-	const span = Sentry.startInactiveSpan({
+	const span = startTelemetrySegment({
 		op: "openclaw.message.dispatch",
 		name: `message.dispatch.${evt.outcome}`,
 		startTime: startTimeMs,
@@ -629,7 +629,7 @@ function recordMessageProcessedSpan(
 	const durationMs = evt.durationMs ?? 50;
 	const startTimeMs = endTimeMs - durationMs;
 
-	const span = Sentry.startInactiveSpan({
+	const span = startTelemetrySegment({
 		op: "openclaw.message",
 		name: `message.${evt.outcome}`,
 		startTime: startTimeMs,
@@ -656,6 +656,21 @@ function recordMessageProcessedSpan(
 		}
 		span.end(endTimeMs);
 	}
+}
+
+function startTelemetrySegment(options: SentryStartSpanOptions): SentrySpan {
+	return Sentry.startSpanManual(
+		{
+			parentSpan: null,
+			forceTransaction: true,
+			...options,
+			experimental: {
+				...options.experimental,
+				standalone: true,
+			},
+		},
+		(span) => span,
+	);
 }
 
 function withDiagnosticTrace(

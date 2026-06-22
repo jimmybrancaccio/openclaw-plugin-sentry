@@ -126,8 +126,7 @@ function recordModelUsageSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
     const startTimeMs = endTimeMs - durationMs;
-    // startInactiveSpan with explicit timestamps (Sentry v10 accepts ms)
-    const span = Sentry.startInactiveSpan({
+    const span = startTelemetrySegment({
         op: "ai.chat",
         name: spanName,
         startTime: startTimeMs,
@@ -157,7 +156,7 @@ function recordModelCallStarted(evt) {
     if (!key)
         return;
     withDiagnosticTrace(parentTraceContext(evt.trace), () => {
-        const span = Sentry.startInactiveSpan({
+        const span = startTelemetrySegment({
             op: "ai.chat",
             name: modelCallSpanName(evt),
             startTime: evt.ts,
@@ -197,7 +196,7 @@ function recordModelCallSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 100;
     const startTimeMs = endTimeMs - durationMs;
-    const span = Sentry.startInactiveSpan({
+    const span = startTelemetrySegment({
         op: "ai.chat",
         name: modelCallSpanName(evt),
         startTime: startTimeMs,
@@ -310,7 +309,7 @@ function recordMessageDispatchCompletedSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs;
     const startTimeMs = endTimeMs - durationMs;
-    const span = Sentry.startInactiveSpan({
+    const span = startTelemetrySegment({
         op: "openclaw.message.dispatch",
         name: `message.dispatch.${evt.outcome}`,
         startTime: startTimeMs,
@@ -353,7 +352,7 @@ function recordMessageProcessedSpan(evt) {
     const endTimeMs = evt.ts;
     const durationMs = evt.durationMs ?? 50;
     const startTimeMs = endTimeMs - durationMs;
-    const span = Sentry.startInactiveSpan({
+    const span = startTelemetrySegment({
         op: "openclaw.message",
         name: `message.${evt.outcome}`,
         startTime: startTimeMs,
@@ -379,6 +378,17 @@ function recordMessageProcessedSpan(evt) {
         }
         span.end(endTimeMs);
     }
+}
+function startTelemetrySegment(options) {
+    return Sentry.startSpanManual({
+        parentSpan: null,
+        forceTransaction: true,
+        ...options,
+        experimental: {
+            ...options.experimental,
+            standalone: true,
+        },
+    }, (span) => span);
 }
 function withDiagnosticTrace(trace, fn) {
     const sentryTrace = formatSentryTraceHeader(trace);
